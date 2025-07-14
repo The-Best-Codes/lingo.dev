@@ -18,6 +18,17 @@ describe("ConflictParser", () => {
     expect(ConflictParser.hasConflictMarkers(content)).toBe(true);
   });
 
+  it("should not detect invalid conflict markers", () => {
+    const content = `
+{
+  "version": 0.1,
+<<<<<<< HEAD
+  "ours": true
+>>>>>>> branch
+}`;
+    expect(ConflictParser.hasConflictMarkers(content)).toBe(false);
+  });
+
   it("should parse simple conflict", () => {
     const content = `
 {
@@ -32,6 +43,14 @@ describe("ConflictParser", () => {
     expect(conflicts).toHaveLength(1);
     expect(conflicts[0].ours.trim()).toBe('"ours": true');
     expect(conflicts[0].theirs.trim()).toBe('"theirs": true');
+  });
+
+  it("should handle Windows line endings", () => {
+    const content =
+      '{\r\n<<<<<<< HEAD\r\n  "ours": true\r\n=======\r\n  "theirs": true\r\n>>>>>>> branch\r\n}';
+    const conflicts = ConflictParser.parseConflicts(content);
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0].ours.trim()).toBe('"ours": true');
   });
 
   it("should resolve conflicts with custom resolver", () => {
@@ -68,7 +87,7 @@ describe("ConflictResolver", () => {
           "content": "Old content"
         },
         "our-scope": {
-          "type": "element", 
+          "type": "element",
           "hash": "our-hash",
           "content": "Our content"
         }
@@ -80,7 +99,7 @@ describe("ConflictResolver", () => {
         },
         "their-scope": {
           "type": "element",
-          "hash": "their-hash", 
+          "hash": "their-hash",
           "content": "Their content"
         }
 >>>>>>> branch
@@ -190,5 +209,37 @@ describe("ConflictResolver", () => {
     expect(scope1.content.en).toBe("English Updated"); // Prefer non-empty
     expect(scope1.content.es).toBe("Español"); // Keep from ours
     expect(scope1.content.fr).toBe("Français"); // Add from theirs
+  });
+
+  it("should handle invalid JSON gracefully", () => {
+    const resolver = new ConflictResolver({
+      strategy: "smart",
+      verbose: false,
+      dryRun: true,
+      backup: false,
+    });
+
+    const invalidConflict = `{
+  "broken": {
+<<<<<<< HEAD
+    invalid json here
+=======
+    more invalid json
+>>>>>>> branch
+  }
+}`;
+
+    const conflicts = ConflictParser.parseConflicts(invalidConflict);
+    expect(conflicts).toHaveLength(1);
+
+    const resolved = ConflictParser.resolveConflicts(
+      invalidConflict,
+      (conflict) => {
+        return (resolver as any).smartResolveMeta(conflict);
+      },
+    );
+
+    // Should fallback to ours
+    expect(resolved).toContain("invalid json here");
   });
 });

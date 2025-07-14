@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { randomUUID } from "crypto";
 import { ConflictParser, ConflictSection } from "./conflict-parser";
 
 export interface ResolverOptions {
@@ -17,10 +18,22 @@ export interface ResolutionResult {
 }
 
 export class ConflictResolver {
+  private readonly MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB limit
+
   constructor(private options: ResolverOptions) {}
 
   async resolveFile(filePath: string): Promise<ResolutionResult> {
     try {
+      // Check file size
+      const stats = fs.statSync(filePath);
+      if (stats.size > this.MAX_FILE_SIZE) {
+        return {
+          success: false,
+          conflictsResolved: 0,
+          error: `File too large: ${stats.size} bytes (max: ${this.MAX_FILE_SIZE})`,
+        };
+      }
+
       const content = fs.readFileSync(filePath, "utf-8");
 
       if (!ConflictParser.hasConflictMarkers(content)) {
@@ -43,7 +56,7 @@ export class ConflictResolver {
 
       // Create backup if requested
       if (this.options.backup && !this.options.dryRun) {
-        const backupPath = `${filePath}.backup.${Date.now()}`;
+        const backupPath = `${filePath}.backup.${randomUUID()}`;
         fs.writeFileSync(backupPath, content);
       }
 
@@ -116,46 +129,44 @@ export class ConflictResolver {
 
   private smartResolveMeta(conflict: ConflictSection): string {
     try {
-      // The conflict sections contain just the scopes part, not full objects
-      const oursScopes = this.parseJSON(`{${conflict.ours}}`);
-      const theirsScopes = this.parseJSON(`{${conflict.theirs}}`);
+      // Try to parse as complete JSON first
+      const oursData = this.parseJSONFragment(conflict.ours);
+      const theirsData = this.parseJSONFragment(conflict.theirs);
 
-      if (!oursScopes || !theirsScopes) {
-        // If either side is invalid JSON, prefer the valid one
-        return oursScopes ? conflict.ours : conflict.theirs;
+      if (!oursData && !theirsData) {
+        // Both sides are invalid, return original
+        return conflict.ours;
       }
 
-      // Merge the scopes
-      const mergedScopes = { ...oursScopes, ...theirsScopes };
+      if (!oursData) return conflict.theirs;
+      if (!theirsData) return conflict.ours;
 
-      // For conflicting keys, apply smart merge logic
-      for (const [key, theirScope] of Object.entries(theirsScopes)) {
-        if (oursScopes[key]) {
-          const ourScope = oursScopes[key] as any;
-          const theirScopeData = theirScope as any;
-
-          // Prefer the scope with longer content or different hash
-          if (theirScopeData.hash !== ourScope.hash) {
+      // Merge the data
+      const merged = this.deepMerge(
+        oursData,
+        theirsData,
+        (key, ours, theirs) => {
+          // For conflicting keys, prefer the one with longer content or different hash
+          if (typeof ours === "object" && typeof theirs === "object") {
             if (
-              theirScopeData.content &&
-              (!ourScope.content ||
-                theirScopeData.content.length > ourScope.content.length)
+              ours.content &&
+              theirs.content &&
+              typeof theirs.content === "string"
             ) {
-              mergedScopes[key] = theirScopeData;
-            } else {
-              mergedScopes[key] = ourScope;
+              return theirs.content.length > ours.content.length
+                ? theirs
+                : ours;
+            }
+            if (ours.hash && theirs.hash && ours.hash !== theirs.hash) {
+              return theirs;
             }
           }
-        }
-      }
-
-      // Convert back to the conflict section format
-      const entries = Object.entries(mergedScopes).map(
-        ([key, value]) =>
-          `        "${key}": ${JSON.stringify(value, null, 10).replace(/\n/g, "\n        ")}`,
+          return theirs;
+        },
       );
 
-      return entries.join(",\n");
+      // Convert back to the conflict section format
+      return this.formatJSONFragment(merged);
     } catch (error) {
       // Fallback to ours if parsing fails
       return conflict.ours;
@@ -164,221 +175,150 @@ export class ConflictResolver {
 
   private smartResolveDictionary(conflict: ConflictSection): string {
     try {
-      // The conflict sections contain just the entries part
-      const oursEntries = Function(
-        `"use strict"; return ({${conflict.ours}})`,
-      )();
-      const theirsEntries = Function(
-        `"use strict"; return ({${conflict.theirs}})`,
-      )();
+      // Parse the conflict sections as JavaScript object fragments
+      const oursData = this.parseJSFragment(conflict.ours);
+      const theirsData = this.parseJSFragment(conflict.theirs);
 
-      if (!oursEntries || !theirsEntries) {
-        return oursEntries ? conflict.ours : conflict.theirs;
+      if (!oursData && !theirsData) {
+        // Both sides are invalid, return original
+        return conflict.ours;
       }
 
-      // Merge the entries
-      const mergedEntries = { ...oursEntries, ...theirsEntries };
+      if (!oursData) return conflict.theirs;
+      if (!theirsData) return conflict.ours;
 
-      // For conflicting keys, merge the translations
-      for (const [key, theirEntry] of Object.entries(theirsEntries)) {
-        if (oursEntries[key]) {
-          const ourEntry = oursEntries[key] as any;
-          const theirEntryData = theirEntry as any;
-
-          // Merge content translations
-          if (theirEntryData.content && ourEntry.content) {
-            const mergedContent = {
-              ...ourEntry.content,
-              ...theirEntryData.content,
-            };
-
-            // For same locale conflicts, prefer longer/more detailed translations
-            for (const [locale, theirTranslation] of Object.entries(
-              theirEntryData.content,
-            )) {
-              if (ourEntry.content[locale]) {
-                const ourTranslation = ourEntry.content[locale];
-                if (
-                  theirTranslation &&
-                  String(theirTranslation).trim().length >
-                    String(ourTranslation).trim().length
-                ) {
-                  mergedContent[locale] = theirTranslation;
-                } else {
-                  mergedContent[locale] = ourTranslation;
-                }
+      // Merge the data
+      const merged = this.deepMerge(
+        oursData,
+        theirsData,
+        (key, ours, theirs) => {
+          // For conflicting keys, merge translations
+          if (
+            key === "content" &&
+            typeof ours === "object" &&
+            typeof theirs === "object"
+          ) {
+            const mergedContent = { ...ours };
+            for (const [locale, translation] of Object.entries(theirs)) {
+              if (
+                !mergedContent[locale] ||
+                (translation &&
+                  typeof translation === "string" &&
+                  String(translation).trim().length >
+                    String(mergedContent[locale]).trim().length)
+              ) {
+                mergedContent[locale] = translation;
               }
             }
-
-            mergedEntries[key] = {
-              ...theirEntryData,
-              content: mergedContent,
-            };
+            return mergedContent;
           }
-        }
-      }
-
-      // Convert back to the conflict section format
-      const entries = Object.entries(mergedEntries).map(
-        ([key, value]) =>
-          `        "${key}": ${JSON.stringify(value, null, 10).replace(/\n/g, "\n        ")}`,
+          return theirs;
+        },
       );
 
-      return entries.join(",\n");
+      // Convert back to the conflict section format
+      return this.formatJSFragment(merged);
     } catch (error) {
       return conflict.ours;
     }
   }
 
-  private mergeMeta(ours: any, theirs: any): any {
-    // Start with a deep copy of ours to preserve all existing data
-    const merged = JSON.parse(JSON.stringify(ours));
-
-    // Merge version (prefer higher version)
-    if (theirs.version && theirs.version > merged.version) {
-      merged.version = theirs.version;
-    }
-
-    // Merge files
-    if (theirs.files) {
-      merged.files = merged.files || {};
-
-      for (const [fileName, fileData] of Object.entries(theirs.files)) {
-        if (!merged.files[fileName]) {
-          // New file from theirs
-          merged.files[fileName] = fileData;
-        } else {
-          // Merge scopes
-          const ourFile = merged.files[fileName] as any;
-          const theirFile = fileData as any;
-
-          if (theirFile.scopes) {
-            ourFile.scopes = ourFile.scopes || {};
-
-            // Add all scopes from theirs
-            for (const [scopeKey, scopeData] of Object.entries(
-              theirFile.scopes,
-            )) {
-              if (!ourFile.scopes[scopeKey]) {
-                // New scope from theirs
-                ourFile.scopes[scopeKey] = scopeData;
-              } else {
-                // Merge scope data - prefer the one with different hash or longer content
-                const ourScope = ourFile.scopes[scopeKey] as any;
-                const theirScope = scopeData as any;
-
-                if (theirScope.hash !== ourScope.hash) {
-                  // Different hashes, prefer the one with more content
-                  if (
-                    theirScope.content &&
-                    (!ourScope.content ||
-                      theirScope.content.length > ourScope.content.length)
-                  ) {
-                    ourFile.scopes[scopeKey] = theirScope;
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    return merged;
-  }
-
-  private mergeDictionary(ours: any, theirs: any): any {
-    // Start with a deep copy of ours to preserve all existing data
-    const merged = JSON.parse(JSON.stringify(ours));
-
-    // Merge version
-    if (theirs.version && theirs.version > merged.version) {
-      merged.version = theirs.version;
-    }
-
-    // Merge files
-    if (theirs.files) {
-      merged.files = merged.files || {};
-
-      for (const [fileName, fileData] of Object.entries(theirs.files)) {
-        if (!merged.files[fileName]) {
-          merged.files[fileName] = fileData;
-        } else {
-          // Merge entries
-          const ourFile = merged.files[fileName] as any;
-          const theirFile = fileData as any;
-
-          if (theirFile.entries) {
-            ourFile.entries = ourFile.entries || {};
-
-            for (const [entryKey, entryData] of Object.entries(
-              theirFile.entries,
-            )) {
-              if (!ourFile.entries[entryKey]) {
-                ourFile.entries[entryKey] = entryData;
-              } else {
-                // Merge translations
-                const ourEntry = ourFile.entries[entryKey] as any;
-                const theirEntry = entryData as any;
-
-                if (theirEntry.content) {
-                  ourEntry.content = ourEntry.content || {};
-
-                  // Merge locale translations, keeping existing and adding new ones
-                  for (const [locale, translation] of Object.entries(
-                    theirEntry.content,
-                  )) {
-                    if (!ourEntry.content[locale]) {
-                      // Add new locale translation
-                      ourEntry.content[locale] = translation;
-                    } else if (
-                      translation &&
-                      String(translation).trim() &&
-                      String(translation).trim().length >
-                        String(ourEntry.content[locale]).trim().length
-                    ) {
-                      // Prefer longer/more detailed translation
-                      ourEntry.content[locale] = translation;
-                    }
-                  }
-                }
-
-                // Update hash if theirs is different
-                if (theirEntry.hash && theirEntry.hash !== ourEntry.hash) {
-                  ourEntry.hash = theirEntry.hash;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    return merged;
-  }
-
-  private parseJSON(content: string): any {
+  private parseJSONFragment(fragment: string): any {
     try {
-      return JSON.parse(content.trim());
+      // Try to parse as complete JSON object
+      const trimmed = fragment.trim();
+      if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+        return JSON.parse(trimmed);
+      }
+
+      // Try to parse as JSON object with wrapping braces
+      const wrapped = `{${trimmed}}`;
+      return JSON.parse(wrapped);
+    } catch {
+      // Try to parse individual key-value pairs
+      try {
+        const result: any = {};
+        const lines = fragment.split(/\n/);
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.includes(":")) {
+            const match = trimmed.match(/"([^"]+)"\s*:\s*(.+)/);
+            if (match) {
+              try {
+                result[match[1]] = JSON.parse(match[2]);
+              } catch {
+                // Remove quotes if present
+                result[match[1]] = match[2]
+                  .replace(/^["']|["']$/g, "")
+                  .replace(/\\"/g, '"');
+              }
+            }
+          }
+        }
+
+        return Object.keys(result).length > 0 ? result : null;
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  private parseJSFragment(fragment: string): any {
+    try {
+      // Try to parse as JSON-like structure
+      const cleaned = fragment
+        .trim()
+        .replace(/'/g, '"') // Convert single quotes to double
+        .replace(/(\w+):/g, '"$1":') // Quote unquoted keys
+        .replace(/,\s*\n\s*}/g, "}") // Remove trailing commas
+        .replace(/,\s*\n\s*]/g, "]")
+        .replace(/;$/g, "");
+
+      return this.parseJSONFragment(cleaned);
     } catch {
       return null;
     }
   }
 
-  private parseDictionary(content: string): any {
-    try {
-      // Remove export default and evaluate as JavaScript object
-      const objectContent = content
-        .replace(/^export\s+default\s+/, "")
-        .replace(/;?\s*$/, "");
-      return Function(`"use strict"; return (${objectContent})`)();
-    } catch {
-      return null;
+  private formatJSONFragment(data: any): string {
+    if (!data || typeof data !== "object") {
+      return "";
     }
+
+    const entries = Object.entries(data).map(
+      ([key, value]) =>
+        `        "${key}": ${JSON.stringify(value, null, 10).replace(/\n/g, "\n        ")}`,
+    );
+    return entries.join(",\n");
   }
 
-  private formatDictionary(data: any): string {
-    return `export default ${JSON.stringify(data, null, 2)};`;
+  private formatJSFragment(data: any): string {
+    return this.formatJSONFragment(data);
+  }
+
+  private deepMerge(
+    target: any,
+    source: any,
+    resolver?: (key: string, target: any, source: any) => any,
+  ): any {
+    if (!source || typeof source !== "object") return source;
+
+    const result = Array.isArray(source)
+      ? [...(target || [])]
+      : { ...(target || {}) };
+
+    for (const [key, value] of Object.entries(source)) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        result[key] = this.deepMerge(result[key], value, resolver);
+      } else if (resolver && key in result) {
+        result[key] = resolver(key, result[key], value);
+      } else {
+        result[key] = value;
+      }
+    }
+
+    return result;
   }
 
   private validateResolvedContent(
@@ -391,8 +331,15 @@ export class ConflictResolver {
       if (fileName === "meta.json") {
         JSON.parse(content);
       } else if (fileName.startsWith("dictionary.")) {
-        // Basic syntax check for dictionary files
-        this.parseDictionary(content);
+        // Validate as JSON-like structure
+        const jsonContent = content
+          .replace(/^export\s+default\s+/, "")
+          .replace(/;?\s*$/, "")
+          .replace(/'/g, '"')
+          .replace(/(\w+):/g, '"$1":')
+          .replace(/,\s*\n\s*}/g, "}")
+          .replace(/,\s*\n\s*]/g, "]");
+        JSON.parse(jsonContent);
       }
       return { valid: true };
     } catch (error: any) {

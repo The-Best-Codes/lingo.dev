@@ -13,15 +13,30 @@ export class ConflictParser {
   private static readonly CONFLICT_END = /^>{7} (.+)$/;
 
   static hasConflictMarkers(content: string): boolean {
-    return (
-      content.includes("<<<<<<<") &&
-      content.includes("=======") &&
-      content.includes(">>>>>>>")
-    );
+    const lines = content.split(/\r?\n/);
+    let hasStart = false;
+    let hasMiddle = false;
+    let hasEnd = false;
+    let startCount = 0;
+    let endCount = 0;
+
+    for (const line of lines) {
+      if (this.CONFLICT_START.test(line)) {
+        hasStart = true;
+        startCount++;
+      } else if (this.CONFLICT_MIDDLE.test(line)) {
+        hasMiddle = true;
+      } else if (this.CONFLICT_END.test(line)) {
+        hasEnd = true;
+        endCount++;
+      }
+    }
+
+    return hasStart && hasMiddle && hasEnd && startCount === endCount;
   }
 
   static parseConflicts(content: string): ConflictSection[] {
-    const lines = content.split("\n");
+    const lines = content.split(/\r?\n/);
     const conflicts: ConflictSection[] = [];
 
     let i = 0;
@@ -93,7 +108,7 @@ export class ConflictParser {
     content: string,
     resolver: (conflict: ConflictSection) => string,
   ): string {
-    const lines = content.split("\n");
+    const lines = content.split(/\r?\n/);
     const conflicts = this.parseConflicts(content);
 
     // Process conflicts in reverse order to maintain line indices
@@ -105,7 +120,7 @@ export class ConflictParser {
       lines.splice(
         conflict.startLine,
         conflict.endLine - conflict.startLine + 1,
-        ...resolution.split("\n"),
+        ...resolution.split(/\r?\n/),
       );
     }
 
