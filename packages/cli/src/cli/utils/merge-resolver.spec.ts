@@ -1,10 +1,11 @@
+import { describe, it, expect } from "vitest";
 import { ConflictParser } from "./conflict-parser";
 import { ConflictResolver } from "./merge-resolver";
 import * as fs from "fs";
 import * as path from "path";
 
 describe("ConflictParser", () => {
-  test("should detect conflict markers", () => {
+  it("should detect conflict markers", () => {
     const content = `
 {
   "version": 0.1,
@@ -17,7 +18,7 @@ describe("ConflictParser", () => {
     expect(ConflictParser.hasConflictMarkers(content)).toBe(true);
   });
 
-  test("should parse simple conflict", () => {
+  it("should parse simple conflict", () => {
     const content = `
 {
   "version": 0.1,
@@ -33,7 +34,7 @@ describe("ConflictParser", () => {
     expect(conflicts[0].theirs.trim()).toBe('"theirs": true');
   });
 
-  test("should resolve conflicts with custom resolver", () => {
+  it("should resolve conflicts with custom resolver", () => {
     const content = `
 {
   "version": 0.1,
@@ -121,7 +122,7 @@ describe("ConflictResolver", () => {
   }
 };`;
 
-  test("should merge meta.json conflicts intelligently", () => {
+  it("should merge meta.json conflicts intelligently", () => {
     const resolver = new ConflictResolver({
       strategy: "smart",
       verbose: false,
@@ -132,10 +133,11 @@ describe("ConflictResolver", () => {
     const conflicts = ConflictParser.parseConflicts(mockMetaConflict);
     expect(conflicts).toHaveLength(1);
 
+    // Test the full resolution flow
     const resolved = ConflictParser.resolveConflicts(
       mockMetaConflict,
       (conflict) => {
-        return resolver["smartResolveMeta"](conflict);
+        return (resolver as any).smartResolveMeta(conflict);
       },
     );
 
@@ -151,7 +153,7 @@ describe("ConflictResolver", () => {
     );
   });
 
-  test("should merge dictionary conflicts intelligently", () => {
+  it("should merge dictionary conflicts intelligently", () => {
     const resolver = new ConflictResolver({
       strategy: "smart",
       verbose: false,
@@ -162,10 +164,11 @@ describe("ConflictResolver", () => {
     const conflicts = ConflictParser.parseConflicts(mockDictionaryConflict);
     expect(conflicts).toHaveLength(1);
 
+    // Test the full resolution flow
     const resolved = ConflictParser.resolveConflicts(
       mockDictionaryConflict,
       (conflict) => {
-        return resolver["smartResolveDictionary"](conflict);
+        return (resolver as any).smartResolveDictionary(conflict);
       },
     );
 
@@ -176,7 +179,7 @@ describe("ConflictResolver", () => {
     const objectContent = resolved
       .replace(/^export\s+default\s+/, "")
       .replace(/;?\s*$/, "");
-    const parsed = eval(`(${objectContent})`);
+    const parsed = Function(`"use strict"; return (${objectContent})`)();
 
     // Should contain both scopes
     expect(parsed.files["App.tsx"].entries["scope-1"]).toBeDefined();

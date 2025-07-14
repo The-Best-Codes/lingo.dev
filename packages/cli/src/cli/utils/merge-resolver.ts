@@ -116,17 +116,46 @@ export class ConflictResolver {
 
   private smartResolveMeta(conflict: ConflictSection): string {
     try {
-      const ours = this.parseJSON(conflict.ours);
-      const theirs = this.parseJSON(conflict.theirs);
+      // The conflict sections contain just the scopes part, not full objects
+      const oursScopes = this.parseJSON(`{${conflict.ours}}`);
+      const theirsScopes = this.parseJSON(`{${conflict.theirs}}`);
 
-      if (!ours || !theirs) {
+      if (!oursScopes || !theirsScopes) {
         // If either side is invalid JSON, prefer the valid one
-        return ours ? conflict.ours : conflict.theirs;
+        return oursScopes ? conflict.ours : conflict.theirs;
       }
 
-      // Merge meta.json intelligently
-      const merged = this.mergeMeta(ours, theirs);
-      return JSON.stringify(merged, null, 2);
+      // Merge the scopes
+      const mergedScopes = { ...oursScopes, ...theirsScopes };
+
+      // For conflicting keys, apply smart merge logic
+      for (const [key, theirScope] of Object.entries(theirsScopes)) {
+        if (oursScopes[key]) {
+          const ourScope = oursScopes[key] as any;
+          const theirScopeData = theirScope as any;
+
+          // Prefer the scope with longer content or different hash
+          if (theirScopeData.hash !== ourScope.hash) {
+            if (
+              theirScopeData.content &&
+              (!ourScope.content ||
+                theirScopeData.content.length > ourScope.content.length)
+            ) {
+              mergedScopes[key] = theirScopeData;
+            } else {
+              mergedScopes[key] = ourScope;
+            }
+          }
+        }
+      }
+
+      // Convert back to the conflict section format
+      const entries = Object.entries(mergedScopes).map(
+        ([key, value]) =>
+          `        "${key}": ${JSON.stringify(value, null, 10).replace(/\n/g, "\n        ")}`,
+      );
+
+      return entries.join(",\n");
     } catch (error) {
       // Fallback to ours if parsing fails
       return conflict.ours;
@@ -135,27 +164,78 @@ export class ConflictResolver {
 
   private smartResolveDictionary(conflict: ConflictSection): string {
     try {
-      // Parse JavaScript/TypeScript export default syntax
-      const ours = this.parseDictionary(conflict.ours);
-      const theirs = this.parseDictionary(conflict.theirs);
+      // The conflict sections contain just the entries part
+      const oursEntries = Function(
+        `"use strict"; return ({${conflict.ours}})`,
+      )();
+      const theirsEntries = Function(
+        `"use strict"; return ({${conflict.theirs}})`,
+      )();
 
-      if (!ours || !theirs) {
-        return ours ? conflict.ours : conflict.theirs;
+      if (!oursEntries || !theirsEntries) {
+        return oursEntries ? conflict.ours : conflict.theirs;
       }
 
-      // Merge dictionary intelligently
-      const merged = this.mergeDictionary(ours, theirs);
-      return this.formatDictionary(merged);
+      // Merge the entries
+      const mergedEntries = { ...oursEntries, ...theirsEntries };
+
+      // For conflicting keys, merge the translations
+      for (const [key, theirEntry] of Object.entries(theirsEntries)) {
+        if (oursEntries[key]) {
+          const ourEntry = oursEntries[key] as any;
+          const theirEntryData = theirEntry as any;
+
+          // Merge content translations
+          if (theirEntryData.content && ourEntry.content) {
+            const mergedContent = {
+              ...ourEntry.content,
+              ...theirEntryData.content,
+            };
+
+            // For same locale conflicts, prefer longer/more detailed translations
+            for (const [locale, theirTranslation] of Object.entries(
+              theirEntryData.content,
+            )) {
+              if (ourEntry.content[locale]) {
+                const ourTranslation = ourEntry.content[locale];
+                if (
+                  theirTranslation &&
+                  String(theirTranslation).trim().length >
+                    String(ourTranslation).trim().length
+                ) {
+                  mergedContent[locale] = theirTranslation;
+                } else {
+                  mergedContent[locale] = ourTranslation;
+                }
+              }
+            }
+
+            mergedEntries[key] = {
+              ...theirEntryData,
+              content: mergedContent,
+            };
+          }
+        }
+      }
+
+      // Convert back to the conflict section format
+      const entries = Object.entries(mergedEntries).map(
+        ([key, value]) =>
+          `        "${key}": ${JSON.stringify(value, null, 10).replace(/\n/g, "\n        ")}`,
+      );
+
+      return entries.join(",\n");
     } catch (error) {
       return conflict.ours;
     }
   }
 
   private mergeMeta(ours: any, theirs: any): any {
-    const merged = { ...ours };
+    // Start with a deep copy of ours to preserve all existing data
+    const merged = JSON.parse(JSON.stringify(ours));
 
     // Merge version (prefer higher version)
-    if (theirs.version > ours.version) {
+    if (theirs.version && theirs.version > merged.version) {
       merged.version = theirs.version;
     }
 
@@ -175,6 +255,7 @@ export class ConflictResolver {
           if (theirFile.scopes) {
             ourFile.scopes = ourFile.scopes || {};
 
+            // Add all scopes from theirs
             for (const [scopeKey, scopeData] of Object.entries(
               theirFile.scopes,
             )) {
@@ -182,15 +263,16 @@ export class ConflictResolver {
                 // New scope from theirs
                 ourFile.scopes[scopeKey] = scopeData;
               } else {
-                // Merge scope data - prefer the one with different hash (likely newer)
+                // Merge scope data - prefer the one with different hash or longer content
                 const ourScope = ourFile.scopes[scopeKey] as any;
                 const theirScope = scopeData as any;
 
                 if (theirScope.hash !== ourScope.hash) {
-                  // Different hashes, prefer the one with more content or newer timestamp
+                  // Different hashes, prefer the one with more content
                   if (
                     theirScope.content &&
-                    theirScope.content.length > ourScope.content?.length
+                    (!ourScope.content ||
+                      theirScope.content.length > ourScope.content.length)
                   ) {
                     ourFile.scopes[scopeKey] = theirScope;
                   }
@@ -206,10 +288,11 @@ export class ConflictResolver {
   }
 
   private mergeDictionary(ours: any, theirs: any): any {
-    const merged = { ...ours };
+    // Start with a deep copy of ours to preserve all existing data
+    const merged = JSON.parse(JSON.stringify(ours));
 
     // Merge version
-    if (theirs.version > ours.version) {
+    if (theirs.version && theirs.version > merged.version) {
       merged.version = theirs.version;
     }
 
@@ -241,14 +324,20 @@ export class ConflictResolver {
                 if (theirEntry.content) {
                   ourEntry.content = ourEntry.content || {};
 
-                  // Merge locale translations, preferring non-empty values
+                  // Merge locale translations, keeping existing and adding new ones
                   for (const [locale, translation] of Object.entries(
                     theirEntry.content,
                   )) {
-                    if (
-                      !ourEntry.content[locale] ||
-                      (translation && String(translation).trim())
+                    if (!ourEntry.content[locale]) {
+                      // Add new locale translation
+                      ourEntry.content[locale] = translation;
+                    } else if (
+                      translation &&
+                      String(translation).trim() &&
+                      String(translation).trim().length >
+                        String(ourEntry.content[locale]).trim().length
                     ) {
+                      // Prefer longer/more detailed translation
                       ourEntry.content[locale] = translation;
                     }
                   }
@@ -282,7 +371,7 @@ export class ConflictResolver {
       const objectContent = content
         .replace(/^export\s+default\s+/, "")
         .replace(/;?\s*$/, "");
-      return eval(`(${objectContent})`);
+      return Function(`"use strict"; return (${objectContent})`)();
     } catch {
       return null;
     }
